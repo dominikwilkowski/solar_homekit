@@ -58,3 +58,6 @@ uuid = { version = "0.8", features = ["v4", "serde"] }
 env_logger = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.8", features = ["rt-multi-thread", "time", "macros"] }
+
+[lints.rust]
+warnings = "allow"
