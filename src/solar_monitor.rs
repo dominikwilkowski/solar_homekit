@@ -1,8 +1,12 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+	net::{IpAddr, Ipv4Addr, SocketAddr},
+	sync::Arc,
+	time::Duration,
+};
 
 use futures::lock::Mutex;
 use hap::{
-	Config, HapType, MacAddress, Pin, Result,
+	Config as HapConfig, HapType, MacAddress, Pin, Result,
 	accessory::{
 		AccessoryCategory, AccessoryInformation, HapAccessory, bridge::BridgeAccessory, light_sensor::LightSensorAccessory,
 	},
@@ -12,38 +16,51 @@ use hap::{
 use log::{error, info, warn};
 use tokio_modbus::prelude::*;
 
+#[derive(Debug, Clone)]
 pub struct InverterReading {
 	pub power_watts: i32,
 	pub daily_kwh: f32,
 }
 
+#[derive(Debug)]
+pub struct Config {
+	pub inverters: Vec<SocketAddr>,
+	pub pin: [u8; 8],
+	pub name: String,
+	pub host: IpAddr,
+	pub device_id: [u8; 6],
+	pub interval: Duration,
+}
+
+impl Default for Config {
+	fn default() -> Self {
+		Config {
+			inverters: Vec::new(),
+			pin: [1, 1, 1, 2, 2, 3, 3, 3],
+			name: String::from("Solar Monitor"),
+			host: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+			device_id: [10, 20, 30, 40, 50, 60],
+			interval: Duration::from_secs(10),
+		}
+	}
+}
+
 pub struct SolarMonitor {
-	inverters: Vec<SocketAddr>,
-	interval: Duration,
+	config: Config,
 }
 
 impl SolarMonitor {
-	pub fn new(inverters: Vec<&str>) -> Self {
-		SolarMonitor {
-			inverters: inverters
-				.iter()
-				.map(|inverter| inverter.parse::<SocketAddr>().expect("Invalid inverter address"))
-				.collect(),
-			interval: Duration::from_secs(10),
-		}
+	pub fn new(config: Config) -> Self {
+		SolarMonitor { config }
 	}
 
 	pub async fn start(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
 		env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-		let addr1 = self.inverters[0];
-		let addr2 = self.inverters[1];
-
-		// -- HomeKit accessories --
 		let bridge = BridgeAccessory::new(
 			1,
 			AccessoryInformation {
-				name: "Solar Monitor".into(),
+				name: self.config.name.clone(),
 				..Default::default()
 			},
 		)?;
@@ -51,7 +68,7 @@ impl SolarMonitor {
 		let power_total = LightSensorAccessory::new(
 			2,
 			AccessoryInformation {
-				name: "Solar Power Total".into(),
+				name: format!("{} Solar Power Total", self.config.name),
 				..Default::default()
 			},
 		)?;
@@ -59,42 +76,41 @@ impl SolarMonitor {
 		let energy_total = LightSensorAccessory::new(
 			3,
 			AccessoryInformation {
-				name: "Solar Energy Today".into(),
+				name: format!("{} Solar Energy Today", self.config.name),
 				..Default::default()
 			},
 		)?;
 
-		let power_inv1 = LightSensorAccessory::new(
-			4,
-			AccessoryInformation {
-				name: "Solar Power Inv 1".into(),
-				..Default::default()
-			},
-		)?;
+		let inverter_power_accessories = self
+			.config
+			.inverters
+			.iter()
+			.enumerate()
+			.map(|(index, _)| {
+				LightSensorAccessory::new(
+					(4 + index) as u64,
+					AccessoryInformation {
+						name: format!("{} Solar Power Inverter {}", self.config.name, index + 1),
+						..Default::default()
+					},
+				)
+			})
+			.collect::<Result<Vec<LightSensorAccessory>>>()?;
 
-		let power_inv2 = LightSensorAccessory::new(
-			5,
-			AccessoryInformation {
-				name: "Solar Power Inv 2".into(),
-				..Default::default()
-			},
-		)?;
-
-		// -- HAP server --
 		let mut storage = FileStorage::current_dir().await?;
 
 		let config = match storage.load_config().await {
 			Ok(mut config) => {
-				config.host = "0.0.0.0".parse().unwrap();
+				config.host = self.config.host;
 				storage.save_config(&config).await?;
 				config
 			},
 			Err(_) => {
-				let config = Config {
-					host: "0.0.0.0".parse().unwrap(),
-					pin: Pin::new([1, 1, 1, 2, 2, 3, 3, 3])?,
-					name: String::from("Solar Monitor"),
-					device_id: MacAddress::from([10, 20, 30, 40, 50, 60]),
+				let config = HapConfig {
+					host: self.config.host,
+					pin: Pin::new(self.config.pin)?,
+					name: self.config.name.clone(),
+					device_id: MacAddress::from(self.config.device_id),
 					category: AccessoryCategory::Bridge,
 					..Default::default()
 				};
@@ -107,81 +123,72 @@ impl SolarMonitor {
 		server.add_accessory(bridge).await?;
 		let power_total_ptr = server.add_accessory(power_total).await?;
 		let energy_total_ptr = server.add_accessory(energy_total).await?;
-		let power_inv1_ptr = server.add_accessory(power_inv1).await?;
-		let power_inv2_ptr = server.add_accessory(power_inv2).await?;
+		let mut inverter_power_ptrs = Vec::with_capacity(inverter_power_accessories.len());
+		for accessory in inverter_power_accessories {
+			let ptr = server.add_accessory(accessory).await?;
+			inverter_power_ptrs.push(ptr);
+		}
 
 		let handle = server.run_handle();
+		info!("HomeKit bridge started - pair with PIN {:?}", self.config.pin);
 
-		info!("HomeKit bridge started - pair with PIN 111-22-333");
-		info!("Polling inverters at {addr1} and {addr2} every {}s", self.interval.as_secs());
-
-		// -- Polling task --
+		let inverter_addrs = self.config.inverters.clone();
+		info!("Starting polling inverters every {}s", self.config.interval.as_secs());
 		let poller = async move {
-			let mut interval = tokio::time::interval(self.interval);
+			let mut interval = tokio::time::interval(self.config.interval);
 			loop {
 				interval.tick().await;
 
-				let (r1, r2) = tokio::join!(Self::read_inverter(addr1), Self::read_inverter(addr2));
+				let mut tasks = tokio::task::JoinSet::new();
+				for (index, addr) in inverter_addrs.iter().enumerate() {
+					let addr = *addr;
+					tasks.spawn(async move { (index, Self::read_inverter(addr).await) });
+				}
 
-				let reading1 = match r1 {
-					Ok(r) => {
-						info!("inv1: {}W, {:.1}kWh today", r.power_watts, r.daily_kwh);
-						Some(r)
-					},
-					Err(e) => {
-						warn!("inv1 read failed: {e}");
-						None
-					},
-				};
+				let mut readings: Vec<Option<InverterReading>> = vec![None; inverter_addrs.len()];
+				while let Some(result) = tasks.join_next().await {
+					let (index, read_result) = result?;
+					match read_result {
+						Ok(reading) => {
+							info!("Inverter {index}: {}W, {:.1}kWh today", reading.power_watts, reading.daily_kwh);
+							readings[index] = Some(reading);
+						},
+						Err(error) => warn!("Inverter {index} read failed: {error}"),
+					}
+				}
 
-				let reading2 = match r2 {
-					Ok(r) => {
-						info!("inv2: {}W, {:.1}kWh today", r.power_watts, r.daily_kwh);
-						Some(r)
-					},
-					Err(e) => {
-						warn!("inv2 read failed: {e}");
-						None
-					},
-				};
-
-				let watts1 = reading1.as_ref().map_or(0, |r| r.power_watts.max(0));
-				let watts2 = reading2.as_ref().map_or(0, |r| r.power_watts.max(0));
-				let kwh1 = reading1.as_ref().map_or(0.0, |r| r.daily_kwh);
-				let kwh2 = reading2.as_ref().map_or(0.0, |r| r.daily_kwh);
-
-				let total_watts = watts1 + watts2;
-				let total_kwh = kwh1 + kwh2;
+				let total_watts = readings.iter().flatten().map(|reading| reading.power_watts.max(0)).sum::<i32>();
+				let total_kwh = readings.iter().flatten().map(|reading| reading.daily_kwh).sum::<f32>();
 
 				info!("total: {total_watts}W, {total_kwh:.1}kWh today");
 
-				// Update HomeKit characteristics.
-				// Light sensor lux range: 0.0001-100000. Clamp minimum (HomeKit requires > 0).
-				let lux_total_power = (total_watts as f64).max(0.0001);
-				let lux_total_energy = (total_kwh as f64 * 100.0).max(0.0001);
-				let lux_inv1 = (watts1 as f64).max(0.0001);
-				let lux_inv2 = (watts2 as f64).max(0.0001);
+				if let Err(error) = Self::set_lux(&power_total_ptr, Self::clamp_lux(total_watts as f64)).await {
+					error!("failed to update power total: {error}");
+				}
+				if let Err(error) = Self::set_lux(&energy_total_ptr, Self::clamp_lux(total_kwh as f64 * 100.0)).await {
+					error!("failed to update energy total: {error}");
+				}
 
-				if let Err(e) = Self::set_lux(&power_total_ptr, lux_total_power).await {
-					error!("failed to update power total: {e}");
-				}
-				if let Err(e) = Self::set_lux(&energy_total_ptr, lux_total_energy).await {
-					error!("failed to update energy total: {e}");
-				}
-				if let Err(e) = Self::set_lux(&power_inv1_ptr, lux_inv1).await {
-					error!("failed to update power inv1: {e}");
-				}
-				if let Err(e) = Self::set_lux(&power_inv2_ptr, lux_inv2).await {
-					error!("failed to update power inv2: {e}");
+				for (index, inverter_power_ptr) in inverter_power_ptrs.iter().enumerate() {
+					let watts = readings[index].as_ref().map_or(0, |reading| reading.power_watts.max(0));
+					if let Err(error) = Self::set_lux(inverter_power_ptr, Self::clamp_lux(watts as f64)).await {
+						error!("failed to update power inv{index}: {error}");
+					}
 				}
 			}
 
+			// The loop never exits, but the async block needs a return type for try_join!
 			#[allow(unreachable_code)]
 			Ok(())
 		};
 
 		futures::try_join!(handle, poller)?;
 		Ok(())
+	}
+
+	// HomeKit light sensors: lux range 0.0001–100000
+	fn clamp_lux(value: f64) -> f64 {
+		value.max(0.0001)
 	}
 
 	/// Decode a word-swapped int32 from two consecutive Modbus registers.
@@ -191,6 +198,7 @@ impl SolarMonitor {
 		combined as i32
 	}
 
+	/// Access the inverter communication module via Modbus protocol
 	async fn read_inverter(
 		ip: SocketAddr,
 	) -> std::result::Result<InverterReading, Box<dyn std::error::Error + Send + Sync>> {
@@ -230,6 +238,7 @@ impl SolarMonitor {
 		Ok(InverterReading { power_watts, daily_kwh })
 	}
 
+	/// Set the KWH as lux for the sensor
 	async fn set_lux(sensor_ptr: &Arc<Mutex<Box<dyn HapAccessory>>>, value: f64) -> Result<()> {
 		let mut accessory = sensor_ptr.lock().await;
 		let service = accessory.get_mut_service(HapType::LightSensor).expect("missing LightSensor service");
