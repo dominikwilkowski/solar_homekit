@@ -34,8 +34,12 @@ cd /volume1/docker/solar_homekit
 ./solar_homekit >> solar_homekit.log 2>&1 &
 
 # check if running
-pgrep -a solar_homekit
+ps -ef | grep solar_homekit
 tail -f solar_homekit.log
+
+# kill running
+ps -ef | grep solar_homekit
+kill <pid>
 ```
 
 ### Auto-start on boot

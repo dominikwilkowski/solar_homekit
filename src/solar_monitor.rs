@@ -4,6 +4,7 @@ use std::{
 	time::Duration,
 };
 
+use chrono::Datelike;
 use futures::lock::Mutex;
 use hap::{
 	Config as HapConfig, HapType, MacAddress, Pin, Result,
@@ -17,14 +18,17 @@ use log::{error, info, warn};
 use tokio_modbus::prelude::*;
 
 #[derive(Debug, Clone)]
-pub struct InverterReading {
+pub struct Reading {
 	pub power_watts: i32,
-	pub daily_kwh: f32,
+	/// Grid meter watts (negative = export). Only present when read from the meter inverter.
+	pub meter_watts: Option<i32>,
 }
 
 #[derive(Debug)]
 pub struct Config {
 	pub inverters: Vec<SocketAddr>,
+	/// The inverter with the grid meter attached (for export readings via register 5600)
+	pub meter_ip: SocketAddr,
 	pub pin: [u8; 8],
 	pub name: String,
 	pub host: IpAddr,
@@ -36,6 +40,7 @@ impl Default for Config {
 	fn default() -> Self {
 		Config {
 			inverters: Vec::new(),
+			meter_ip: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 502),
 			pin: [1, 1, 1, 2, 2, 3, 3, 3],
 			name: String::from("Solar Monitor"),
 			host: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
@@ -61,41 +66,45 @@ impl SolarMonitor {
 			1,
 			AccessoryInformation {
 				name: self.config.name.clone(),
+				manufacturer: String::from("DomSoft"),
+				model: String::from("DomSoft Bridge"),
+				serial_number: String::from("SOLARBRIDGE0"),
 				..Default::default()
 			},
 		)?;
 
-		let power_total = LightSensorAccessory::new(
+		let production_sensor = LightSensorAccessory::new(
 			2,
 			AccessoryInformation {
-				name: format!("{} Solar Power Total", self.config.name),
+				name: String::from("Production Real-time"),
+				manufacturer: String::from("DomSoft"),
+				model: String::from("Solar production in real time in watts"),
+				serial_number: String::from("SOLARSENSOR1"),
 				..Default::default()
 			},
 		)?;
 
-		let energy_total = LightSensorAccessory::new(
+		let export_sensor = LightSensorAccessory::new(
 			3,
 			AccessoryInformation {
-				name: format!("{} Solar Energy Today", self.config.name),
+				name: String::from("Export Real-time"),
+				manufacturer: String::from("DomSoft"),
+				model: String::from("Solar export in real time in watts"),
+				serial_number: String::from("SOLARSENSOR2"),
 				..Default::default()
 			},
 		)?;
 
-		let inverter_power_accessories = self
-			.config
-			.inverters
-			.iter()
-			.enumerate()
-			.map(|(index, _)| {
-				LightSensorAccessory::new(
-					(4 + index) as u64,
-					AccessoryInformation {
-						name: format!("{} Solar Power Inverter {}", self.config.name, index + 1),
-						..Default::default()
-					},
-				)
-			})
-			.collect::<Result<Vec<LightSensorAccessory>>>()?;
+		let export_today_sensor = LightSensorAccessory::new(
+			4,
+			AccessoryInformation {
+				name: String::from("Export Today"),
+				manufacturer: String::from("DomSoft"),
+				model: String::from("Solar export for all of today in kWh"),
+				serial_number: String::from("SOLARSENSOR3"),
+				..Default::default()
+			},
+		)?;
 
 		let mut storage = FileStorage::current_dir().await?;
 
@@ -121,13 +130,9 @@ impl SolarMonitor {
 
 		let server = IpServer::new(config, storage).await?;
 		server.add_accessory(bridge).await?;
-		let power_total_ptr = server.add_accessory(power_total).await?;
-		let energy_total_ptr = server.add_accessory(energy_total).await?;
-		let mut inverter_power_ptrs = Vec::with_capacity(inverter_power_accessories.len());
-		for accessory in inverter_power_accessories {
-			let ptr = server.add_accessory(accessory).await?;
-			inverter_power_ptrs.push(ptr);
-		}
+		let production_ptr = server.add_accessory(production_sensor).await?;
+		let export_ptr = server.add_accessory(export_sensor).await?;
+		let export_today_ptr = server.add_accessory(export_today_sensor).await?;
 
 		let handle = server.run_handle();
 		info!("HomeKit bridge started - pair with PIN {:?}", self.config.pin);
@@ -136,21 +141,41 @@ impl SolarMonitor {
 		info!("Starting polling inverters every {}s", self.config.interval.as_secs());
 		let poller = async move {
 			let mut interval = tokio::time::interval(self.config.interval);
+			let mut export_kwh_today: f64 = 0.0;
+			let mut last_export_watts: Option<i32> = None;
+			let mut last_tick = tokio::time::Instant::now();
+			let mut last_date = chrono::Local::now().ordinal();
+
 			loop {
 				interval.tick().await;
+				let now = tokio::time::Instant::now();
+				let elapsed_secs = (now - last_tick).as_secs_f64();
+				last_tick = now;
 
+				// Reset daily accumulator when the date changes (before accumulating)
+				let today = chrono::Local::now().ordinal();
+				if today != last_date {
+					info!("Day changed: export today was {export_kwh_today:.2}kWh");
+					export_kwh_today = 0.0;
+					last_export_watts = None;
+					last_date = today;
+				}
+
+				// Read all inverters for production watts.
+				// The meter inverter also reads register 5600 in the same connection.
 				let mut tasks = tokio::task::JoinSet::new();
 				for (index, addr) in inverter_addrs.iter().enumerate() {
 					let addr = *addr;
-					tasks.spawn(async move { (index, Self::read_inverter(addr).await) });
+					let read_meter = addr == self.config.meter_ip;
+					tasks.spawn(async move { (index, Self::read_inverter(addr, read_meter).await) });
 				}
 
-				let mut readings: Vec<Option<InverterReading>> = vec![None; inverter_addrs.len()];
+				let mut readings: Vec<Option<Reading>> = vec![None; inverter_addrs.len()];
 				while let Some(result) = tasks.join_next().await {
 					let (index, read_result) = result?;
 					match read_result {
 						Ok(reading) => {
-							info!("Inverter {index}: {}W, {:.1}kWh today", reading.power_watts, reading.daily_kwh);
+							info!("Inverter {index}: {}W", reading.power_watts);
 							readings[index] = Some(reading);
 						},
 						Err(error) => warn!("Inverter {index} read failed: {error}"),
@@ -158,22 +183,47 @@ impl SolarMonitor {
 				}
 
 				let total_watts = readings.iter().flatten().map(|reading| reading.power_watts.max(0)).sum::<i32>();
-				let total_kwh = readings.iter().flatten().map(|reading| reading.daily_kwh).sum::<f32>();
 
-				info!("total: {total_watts}W, {total_kwh:.1}kWh today");
+				// Extract meter reading from whichever inverter had it
+				let meter_watts = readings.iter().flatten().find_map(|r| r.meter_watts);
+				let export_watts = match meter_watts {
+					Some(watts) => {
+						// Negative = exporting, positive = importing. Negate so positive = export.
+						let export = (-watts).max(0);
+						info!("Grid meter: {watts}W (export: {export}W)");
 
-				if let Err(error) = Self::set_lux(&power_total_ptr, Self::clamp_lux(total_watts as f64)).await {
-					error!("failed to update power total: {error}");
+						// Accumulate daily export kWh (trapezoidal integration using actual elapsed time)
+						if let Some(prev) = last_export_watts {
+							let avg_watts = (prev as f64 + export as f64) / 2.0;
+							let kwh_increment = avg_watts * elapsed_secs / 3600.0;
+							export_kwh_today += kwh_increment;
+						}
+						last_export_watts = Some(export);
+
+						export
+					},
+					None => {
+						warn!("Meter read unavailable this cycle");
+						// Don't update last_export_watts — skip integration next tick rather
+						// than integrating against a fake zero.
+						last_export_watts = None;
+						0
+					},
+				};
+
+				info!(
+					"REPORT: Production RL: {total_watts}W | Export RL: {export_watts}W | Export today: {export_kwh_today:.2}kWh"
+				);
+
+				if let Err(error) = Self::set_lux(&production_ptr, Self::clamp_lux(total_watts as f64)).await {
+					error!("failed to update production: {error}");
 				}
-				if let Err(error) = Self::set_lux(&energy_total_ptr, Self::clamp_lux(total_kwh as f64 * 100.0)).await {
-					error!("failed to update energy total: {error}");
+				if let Err(error) = Self::set_lux(&export_ptr, Self::clamp_lux(export_watts as f64)).await {
+					error!("failed to update export: {error}");
 				}
-
-				for (index, inverter_power_ptr) in inverter_power_ptrs.iter().enumerate() {
-					let watts = readings[index].as_ref().map_or(0, |reading| reading.power_watts.max(0));
-					if let Err(error) = Self::set_lux(inverter_power_ptr, Self::clamp_lux(watts as f64)).await {
-						error!("failed to update power inv{index}: {error}");
-					}
+				// Export today in lux: kWh * 100 (so 5.2kWh = 520 lux)
+				if let Err(error) = Self::set_lux(&export_today_ptr, Self::clamp_lux(export_kwh_today * 100.0)).await {
+					error!("failed to update export today: {error}");
 				}
 			}
 
@@ -198,44 +248,60 @@ impl SolarMonitor {
 		combined as i32
 	}
 
-	/// Access the inverter communication module via Modbus protocol
+	/// Read inverter power via Modbus, and optionally the grid meter (register 5600)
+	/// in the same connection when `read_meter` is true.
 	async fn read_inverter(
 		ip: SocketAddr,
-	) -> std::result::Result<InverterReading, Box<dyn std::error::Error + Send + Sync>> {
+		read_meter: bool,
+	) -> std::result::Result<Reading, Box<dyn std::error::Error + Send + Sync>> {
 		let mut modbus = tcp::connect_slave(ip, Slave(1)).await?;
 
-		// Register 5008-5009: Total active power (int32, word-swapped, watts)
-		// Works on SG string inverters. Falls back to 5600 (meter power) for SH hybrid.
+		// Register 5008-5009: Total active power (I32, word-swapped, watts)
+		// Works on SG string inverters.
+		// Falls back to 5018 (U16, total active power, watts) for inverters that
+		// don't support 5008 (e.g. some SH hybrid models).
 		let power_watts = match modbus.read_input_registers(5008, 2).await? {
 			Ok(registers) => {
 				let watts = Self::decode_i32_word_swap(registers[0], registers[1]);
 				if watts != 0 {
 					watts
 				} else {
-					// 5008 returned 0, try 5600 (meter active power) as fallback
-					match modbus.read_input_registers(5600, 2).await? {
-						Ok(registers) => Self::decode_i32_word_swap(registers[0], registers[1]),
+					// 5008 returned 0, try 5018 (single U16 active power) as fallback
+					match modbus.read_input_registers(5018, 1).await? {
+						Ok(registers) => registers[0] as i32,
 						Err(_) => 0,
 					}
 				}
 			},
-			Err(_) => match modbus.read_input_registers(5600, 2).await? {
-				// 5008 not supported, try 5600
-				Ok(registers) => Self::decode_i32_word_swap(registers[0], registers[1]),
-				Err(_) => 0,
+			Err(_) => {
+				// 5008 not supported, try 5018 (single U16 active power)
+				match modbus.read_input_registers(5018, 1).await? {
+					Ok(registers) => registers[0] as i32,
+					Err(_) => 0,
+				}
 			},
 		};
 
-		// Register 5000: Daily output energy (uint16, factor x0.1 kWh)
-		// Works on both SG and SH inverters.
-		let daily_kwh = match modbus.read_input_registers(5000, 1).await? {
-			Ok(registers) => registers[0] as f32 * 0.1,
-			Err(_) => 0.0,
+		// Register 5600-5601: Meter active power (I32, word-swapped, watts)
+		// Negative = exporting, positive = importing.
+		let meter_watts = if read_meter {
+			match modbus.read_input_registers(5600, 2).await? {
+				Ok(registers) => Some(Self::decode_i32_word_swap(registers[0], registers[1])),
+				Err(error) => {
+					warn!("register 5600 error: {error}");
+					None
+				},
+			}
+		} else {
+			None
 		};
 
 		modbus.disconnect().await?;
 
-		Ok(InverterReading { power_watts, daily_kwh })
+		Ok(Reading {
+			power_watts,
+			meter_watts,
+		})
 	}
 
 	/// Set the KWH as lux for the sensor

@@ -5,6 +5,7 @@ edition = "2024"
 default-run = "solar_homekit"
 
 [dependencies]
+chrono = "0.4"
 env_logger = "0.11"
 futures = "0.3"
 hap = { path = "hap-rs" }
